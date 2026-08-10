@@ -2,7 +2,7 @@
 // @id              taskbar-count-badges
 // @name            Taskbar Count Badges
 // @description     Show count badges on taskbar app buttons.
-// @version         0.1.0
+// @version         0.1.1
 // @author          digART
 // @github          https://github.com/digart11
 // @license         GPL-3.0
@@ -37,6 +37,12 @@
 
 using namespace winrt::Windows::UI::Xaml;
 
+#if __cplusplus < 202302L
+DECLARE_HANDLE(CO_MTA_USAGE_COOKIE);
+WINOLEAPI CoIncrementMTAUsage(CO_MTA_USAGE_COOKIE* cookie);
+WINOLEAPI CoDecrementMTAUsage(CO_MTA_USAGE_COOKIE cookie);
+#endif
+
 // -----------------------------------------------------------------------------
 // Globals
 // -----------------------------------------------------------------------------
@@ -45,6 +51,7 @@ bool g_isTaskbarProcess = false;
 
 std::atomic<bool> g_taskbarViewHooked = false;
 std::atomic<bool> g_unloading = false;
+std::atomic<bool> g_recountQueued = false;
 
 winrt::Windows::UI::Core::CoreDispatcher
     g_taskbarDispatcher{nullptr};
@@ -56,21 +63,22 @@ struct TrackedButton {
 };
 
 std::vector<TrackedButton> g_trackedButtons;
-std::unordered_set<void*> g_trackedButtonPointers;
 
+// Always contains REAL HWND-derived counts.
+// ViewModelCount is used only as a change notification.
 std::unordered_map<std::wstring, unsigned int>
     g_appCounts;
 
 void* g_ITaskbarAppItemViewModelGuid = nullptr;
 
 // -----------------------------------------------------------------------------
-// taskbar.dll symbols used to get the EXISTING XamlRoot
+// taskbar.dll symbols used to access the existing taskbar XamlRoot
 // -----------------------------------------------------------------------------
 
 void* g_CTaskBand_ITaskListWndSite_vftable = nullptr;
 
 using CTaskBand_GetTaskbarHost_t =
-    void*(WINAPI*)(
+    void*(__cdecl*)(
         void* pThis,
         void** result);
 
@@ -80,7 +88,7 @@ CTaskBand_GetTaskbarHost_t
 void* g_TaskbarHost_FrameHeight = nullptr;
 
 using RefCount_Decref_t =
-    void(WINAPI*)(
+    void(__cdecl*)(
         void* pThis);
 
 RefCount_Decref_t
@@ -104,15 +112,8 @@ std::wstring NormalizeId(
     return value;
 }
 
-unsigned int NormalizeCount(
-    unsigned int rawCount) {
-    return rawCount > 0
-        ? rawCount - 1
-        : 0;
-}
-
 // -----------------------------------------------------------------------------
-// Find main taskbar HWND
+// Main taskbar HWND
 // -----------------------------------------------------------------------------
 
 HWND FindCurrentProcessTaskbarWnd() {
@@ -188,7 +189,7 @@ FrameworkElement FindChildByName(
 
     for (int i = 0;
          i < count;
-         ++i) {
+         i++) {
         auto child =
             Media::VisualTreeHelper::
                 GetChild(
@@ -206,13 +207,13 @@ FrameworkElement FindChildByName(
             return child;
         }
 
-        auto found =
+        auto result =
             FindChildByName(
                 child,
                 name);
 
-        if (found) {
-            return found;
+        if (result) {
+            return result;
         }
     }
 
@@ -255,6 +256,7 @@ void UpdateCountBadge(
             .try_as<
                 Controls::Border>();
 
+    // No badge for zero or one window.
     if (count <= 1) {
         if (badge) {
             badge.Visibility(
@@ -307,10 +309,6 @@ void UpdateCountBadge(
             .Children()
             .Append(
                 badge);
-
-        Wh_Log(
-            L"Taskbar Count Badges: "
-            L"created count badge");
     }
 
     auto text =
@@ -335,8 +333,23 @@ void UpdateCountBadge(
 }
 
 // -----------------------------------------------------------------------------
-// Track button
+// Tracked buttons
 // -----------------------------------------------------------------------------
+
+void PruneDeadTrackedButtons() {
+    for (auto it =
+             g_trackedButtons.begin();
+         it !=
+         g_trackedButtons.end();) {
+        if (!it->element.get()) {
+            it =
+                g_trackedButtons.erase(
+                    it);
+        } else {
+            ++it;
+        }
+    }
+}
 
 void TrackTaskbarButton(
     FrameworkElement element) {
@@ -378,9 +391,6 @@ void TrackTaskbarButton(
         return;
     }
 
-    g_trackedButtonPointers.insert(
-        identity);
-
     g_trackedButtons.push_back(
         {
             identity,
@@ -388,15 +398,10 @@ void TrackTaskbarButton(
             winrt::make_weak(
                 element),
         });
-
-    Wh_Log(
-        L"Taskbar Count Badges: "
-        L"tracked button id=\"%s\"",
-        automationId.c_str());
 }
 
 // -----------------------------------------------------------------------------
-// Apply cached count to button
+// Apply cached REAL HWND count
 // -----------------------------------------------------------------------------
 
 void ApplyCountToButton(
@@ -412,12 +417,15 @@ void ApplyCountToButton(
         return;
     }
 
-    auto it =
-        g_appCounts.find(
-            NormalizeId(
-                automationId.c_str()));
+    std::wstring key =
+        NormalizeId(
+            automationId.c_str());
 
     unsigned int count = 0;
+
+    auto it =
+        g_appCounts.find(
+            key);
 
     if (it !=
         g_appCounts.end()) {
@@ -428,6 +436,34 @@ void ApplyCountToButton(
     UpdateCountBadge(
         element,
         count);
+}
+
+void RefreshChangedTrackedButtons(
+    const std::unordered_set<
+        std::wstring>& changedIds) {
+    PruneDeadTrackedButtons();
+
+    for (auto& item :
+         g_trackedButtons) {
+        std::wstring key =
+            NormalizeId(
+                item.automationId);
+
+        if (!changedIds.contains(
+                key)) {
+            continue;
+        }
+
+        auto element =
+            item.element.get();
+
+        if (!element) {
+            continue;
+        }
+
+        ApplyCountToButton(
+            element);
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -466,7 +502,7 @@ int EnumerateExistingTaskbarButtons(
 
         for (int i = 0;
              i < children;
-             ++i) {
+             i++) {
             auto child =
                 Media::VisualTreeHelper::
                     GetChild(
@@ -490,7 +526,7 @@ int EnumerateExistingTaskbarButtons(
 }
 
 // -----------------------------------------------------------------------------
-// Get XamlRoot from existing TaskbarHost
+// Existing taskbar XamlRoot
 // -----------------------------------------------------------------------------
 
 XamlRoot GetTaskbarXamlRoot(
@@ -528,12 +564,11 @@ XamlRoot GetTaskbarXamlRoot(
     }
 
     void* site = taskBand;
-
     bool siteFound = false;
 
     for (int i = 0;
          i < 20;
-         ++i) {
+         i++) {
         if (*reinterpret_cast<void**>(
                 site) ==
             g_CTaskBand_ITaskListWndSite_vftable) {
@@ -570,39 +605,35 @@ XamlRoot GetTaskbarXamlRoot(
         return nullptr;
     }
 
-    size_t elementOffset =
-        0x48;
+    size_t elementOffset = 0;
 
 #if defined(_M_X64)
-    {
-        const BYTE* code =
-            reinterpret_cast<
-                const BYTE*>(
-                g_TaskbarHost_FrameHeight);
+    const BYTE* code =
+        reinterpret_cast<
+            const BYTE*>(
+            g_TaskbarHost_FrameHeight);
 
-        // TaskbarHost::FrameHeight currently starts by
-        // adjusting "this" to the embedded XAML object.
-        if (code[0] == 0x48 &&
-            code[1] == 0x83 &&
-            code[2] == 0xEC &&
-            code[4] == 0x48 &&
-            code[5] == 0x83 &&
-            code[6] == 0xC1 &&
-            code[7] <= 0x7F) {
-            elementOffset =
-                code[7];
-        } else {
-            Wh_Log(
-                L"Taskbar Count Badges: "
-                L"couldn't detect TaskbarHost XAML offset");
+    if (code[0] == 0x48 &&
+        code[1] == 0x83 &&
+        code[2] == 0xEC &&
+        code[4] == 0x48 &&
+        code[5] == 0x83 &&
+        code[6] == 0xC1 &&
+        code[7] <= 0x7F) {
+        elementOffset =
+            code[7];
+    } else {
+        Wh_Log(
+            L"Taskbar Count Badges: "
+            L"couldn't detect TaskbarHost "
+            L"XAML offset");
 
-            if (hostShared[1]) {
-                g_RefCount_Decref(
-                    hostShared[1]);
-            }
-
-            return nullptr;
+        if (hostShared[1]) {
+            g_RefCount_Decref(
+                hostShared[1]);
         }
+
+        return nullptr;
     }
 #endif
 
@@ -637,7 +668,7 @@ XamlRoot GetTaskbarXamlRoot(
 }
 
 // -----------------------------------------------------------------------------
-// Run code synchronously on taskbar UI thread
+// Run synchronously on taskbar UI thread
 // -----------------------------------------------------------------------------
 
 using TaskbarThreadProc =
@@ -665,12 +696,14 @@ bool RunOnTaskbarThread(
     if (threadId ==
         GetCurrentThreadId()) {
         proc(parameter);
+
         return true;
     }
 
     static UINT message =
         RegisterWindowMessageW(
-            L"Windhawk_TaskbarCountBadges_RunOnTaskbarThread");
+            L"Windhawk_TaskbarCountBadges_"
+            L"RunOnTaskbarThread");
 
     struct Request {
         TaskbarThreadProc proc;
@@ -737,71 +770,8 @@ bool RunOnTaskbarThread(
 }
 
 // -----------------------------------------------------------------------------
-// INITIALIZE ALREADY EXISTING BUTTONS
+// App resolver
 // -----------------------------------------------------------------------------
-
-void WINAPI InitializeExistingButtonsOnTaskbarThread(
-    void* parameter) {
-    HWND taskbarWnd =
-        reinterpret_cast<HWND>(
-            parameter);
-
-    Wh_Log(
-        L"Taskbar Count Badges: "
-        L"initial XAML enumeration started");
-
-    auto xamlRoot =
-        GetTaskbarXamlRoot(
-            taskbarWnd);
-
-    if (!xamlRoot) {
-        Wh_Log(
-            L"Taskbar Count Badges: "
-            L"failed to get taskbar XamlRoot");
-
-        return;
-    }
-
-    auto content =
-        xamlRoot.Content()
-            .try_as<
-                FrameworkElement>();
-
-    if (!content) {
-        Wh_Log(
-            L"Taskbar Count Badges: "
-            L"XamlRoot has no FrameworkElement content");
-
-        return;
-    }
-
-    if (!g_taskbarDispatcher) {
-        g_taskbarDispatcher =
-            content.Dispatcher();
-    }
-
-    int count =
-        EnumerateExistingTaskbarButtons(
-            content);
-
-    Wh_Log(
-        L"Taskbar Count Badges: "
-        L"initial XAML enumeration complete "
-        L"buttons=%d",
-        count);
-}
-
-// -----------------------------------------------------------------------------
-// Startup HWND/AppID count
-// -----------------------------------------------------------------------------
-
-#if __cplusplus < 202302L
-DECLARE_HANDLE(CO_MTA_USAGE_COOKIE);
-WINOLEAPI CoIncrementMTAUsage(
-    CO_MTA_USAGE_COOKIE* cookie);
-WINOLEAPI CoDecrementMTAUsage(
-    CO_MTA_USAGE_COOKIE cookie);
-#endif
 
 constexpr winrt::guid
     CLSID_StartMenuCacheAndAppResolver{
@@ -809,14 +779,8 @@ constexpr winrt::guid
         0x73A9,
         0x4B58,
         {
-            0x8C,
-            0xAE,
-            0x35,
-            0x5B,
-            0x7F,
-            0x55,
-            0x34,
-            0x1B,
+            0x8C, 0xAE, 0x35, 0x5B,
+            0x7F, 0x55, 0x34, 0x1B,
         }};
 
 constexpr winrt::guid
@@ -825,14 +789,8 @@ constexpr winrt::guid
         0x72DE,
         0x44B4,
         {
-            0x93,
-            0x73,
-            0x05,
-            0x17,
-            0x04,
-            0x50,
-            0xC1,
-            0x40,
+            0x93, 0x73, 0x05, 0x17,
+            0x04, 0x50, 0xC1, 0x40,
         }};
 
 struct IAppResolver_8 :
@@ -860,19 +818,38 @@ struct IAppResolver_8 :
             void* unknown3) = 0;
 };
 
-struct WindowEnumContext {
-    IAppResolver_8* resolver;
-    std::unordered_map<
-        std::wstring,
-        unsigned int>* rawCounts;
-};
+// -----------------------------------------------------------------------------
+// Which HWNDs count as taskbar windows
+// -----------------------------------------------------------------------------
 
-BOOL CALLBACK EnumStartupWindows(
-    HWND hWnd,
-    LPARAM param) {
-    if (!IsWindowVisible(
+bool IsCountableWindow(
+    HWND hWnd) {
+    if (!hWnd ||
+        !IsWindowVisible(
             hWnd)) {
-        return TRUE;
+        return false;
+    }
+
+    WCHAR className[128] = {};
+
+    if (GetClassNameW(
+            hWnd,
+            className,
+            ARRAYSIZE(className))) {
+        if (_wcsicmp(
+                className,
+                L"Shell_TrayWnd") == 0 ||
+            _wcsicmp(
+                className,
+                L"Shell_SecondaryTrayWnd") == 0 ||
+            _wcsicmp(
+                className,
+                L"Progman") == 0 ||
+            _wcsicmp(
+                className,
+                L"WorkerW") == 0) {
+            return false;
+        }
     }
 
     LONG_PTR exStyle =
@@ -884,7 +861,7 @@ BOOL CALLBACK EnumStartupWindows(
          WS_EX_TOOLWINDOW) &&
         !(exStyle &
           WS_EX_APPWINDOW)) {
-        return TRUE;
+        return false;
     }
 
     HWND owner =
@@ -895,6 +872,64 @@ BOOL CALLBACK EnumStartupWindows(
     if (owner &&
         !(exStyle &
           WS_EX_APPWINDOW)) {
+        return false;
+    }
+
+    HMODULE dwmApi =
+        GetModuleHandleW(
+            L"dwmapi.dll");
+
+    if (dwmApi) {
+        using DwmGetWindowAttribute_t =
+            HRESULT(WINAPI*)(
+                HWND,
+                DWORD,
+                PVOID,
+                DWORD);
+
+        auto getAttribute =
+            reinterpret_cast<
+                DwmGetWindowAttribute_t>(
+                GetProcAddress(
+                    dwmApi,
+                    "DwmGetWindowAttribute"));
+
+        if (getAttribute) {
+            DWORD cloaked = 0;
+
+            // DWMWA_CLOAKED = 14
+            if (SUCCEEDED(
+                    getAttribute(
+                        hWnd,
+                        14,
+                        &cloaked,
+                        sizeof(cloaked))) &&
+                cloaked) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// Build real HWND/AppID count map
+// -----------------------------------------------------------------------------
+
+struct WindowEnumContext {
+    IAppResolver_8* resolver;
+
+    std::unordered_map<
+        std::wstring,
+        unsigned int>* counts;
+};
+
+BOOL CALLBACK EnumCountableWindows(
+    HWND hWnd,
+    LPARAM param) {
+    if (!IsCountableWindow(
+            hWnd)) {
         return TRUE;
     }
 
@@ -902,6 +937,12 @@ BOOL CALLBACK EnumStartupWindows(
         reinterpret_cast<
             WindowEnumContext*>(
             param);
+
+    if (!context ||
+        !context->resolver ||
+        !context->counts) {
+        return TRUE;
+    }
 
     WCHAR* appId = nullptr;
 
@@ -934,26 +975,27 @@ BOOL CALLBACK EnumStartupWindows(
     CoTaskMemFree(
         appId);
 
-    (*context->rawCounts)[
-        key]++;
+    (*context->counts)[key]++;
 
     return TRUE;
 }
 
-void BuildInitialCounts() {
-    std::unordered_map<
-        std::wstring,
-        unsigned int>
-        rawCounts;
+// -----------------------------------------------------------------------------
+// Rebuild real counts and report only changed AppIDs
+// -----------------------------------------------------------------------------
 
+bool BuildRealWindowCounts(
+    std::unordered_set<
+        std::wstring>* changedIds,
+    bool initialBuild) {
     CO_MTA_USAGE_COOKIE cookie{};
+
     bool mta =
         SUCCEEDED(
             CoIncrementMTAUsage(
                 &cookie));
 
-    winrt::com_ptr<
-        IAppResolver_8>
+    winrt::com_ptr<IAppResolver_8>
         resolver;
 
     HRESULT hr =
@@ -969,45 +1011,33 @@ void BuildInitialCounts() {
         !resolver) {
         Wh_Log(
             L"Taskbar Count Badges: "
-            L"AppResolver failed");
+            L"AppResolver failed "
+            L"hr=0x%08X",
+            static_cast<unsigned int>(
+                hr));
 
         if (mta) {
             CoDecrementMTAUsage(
                 cookie);
         }
 
-        return;
+        return false;
     }
+
+    std::unordered_map<
+        std::wstring,
+        unsigned int>
+        newCounts;
 
     WindowEnumContext context{
         resolver.get(),
-        &rawCounts,
+        &newCounts,
     };
 
     EnumWindows(
-        EnumStartupWindows,
+        EnumCountableWindows,
         reinterpret_cast<LPARAM>(
             &context));
-
-    g_appCounts.clear();
-
-    for (const auto& pair :
-         rawCounts) {
-        unsigned int actual =
-            NormalizeCount(
-                pair.second);
-
-        g_appCounts[
-            pair.first] =
-            actual;
-
-        Wh_Log(
-            L"Taskbar Count Badges: "
-            L"INITIAL id=\"%s\" raw=%u actual=%u",
-            pair.first.c_str(),
-            pair.second,
-            actual);
-    }
 
     resolver = nullptr;
 
@@ -1015,10 +1045,208 @@ void BuildInitialCounts() {
         CoDecrementMTAUsage(
             cookie);
     }
+
+    if (initialBuild) {
+        g_appCounts =
+            std::move(
+                newCounts);
+
+        size_t multiWindowApps = 0;
+
+        for (const auto& pair :
+             g_appCounts) {
+            if (pair.second > 1) {
+                multiWindowApps++;
+            }
+        }
+
+        Wh_Log(
+            L"Taskbar Count Badges: "
+            L"initial window counts ready "
+            L"apps=%zu multi=%zu",
+            g_appCounts.size(),
+            multiWindowApps);
+
+        return true;
+    }
+
+    if (!changedIds) {
+        return false;
+    }
+
+    changedIds->clear();
+
+    // Existing/changed/removed entries.
+    for (const auto& oldPair :
+         g_appCounts) {
+        auto newIt =
+            newCounts.find(
+                oldPair.first);
+
+        unsigned int newCount =
+            newIt !=
+                    newCounts.end()
+                ? newIt->second
+                : 0;
+
+        if (oldPair.second ==
+            newCount) {
+            continue;
+        }
+
+        changedIds->insert(
+            oldPair.first);
+
+        Wh_Log(
+            L"Taskbar Count Badges: "
+            L"count changed id=\"%s\" "
+            L"%u -> %u",
+            oldPair.first.c_str(),
+            oldPair.second,
+            newCount);
+    }
+
+    // Completely new entries.
+    for (const auto& newPair :
+         newCounts) {
+        if (g_appCounts.find(
+                newPair.first) !=
+            g_appCounts.end()) {
+            continue;
+        }
+
+        changedIds->insert(
+            newPair.first);
+
+        Wh_Log(
+            L"Taskbar Count Badges: "
+            L"count changed id=\"%s\" "
+            L"0 -> %u",
+            newPair.first.c_str(),
+            newPair.second);
+    }
+
+    g_appCounts =
+        std::move(
+            newCounts);
+
+    return true;
 }
 
 // -----------------------------------------------------------------------------
-// TaskListButton hook - handles buttons created/updated AFTER initialization
+// Initial existing taskbar button enumeration
+// -----------------------------------------------------------------------------
+
+void WINAPI
+InitializeExistingButtonsOnTaskbarThread(
+    void* parameter) {
+    HWND taskbarWnd =
+        reinterpret_cast<HWND>(
+            parameter);
+
+    auto xamlRoot =
+        GetTaskbarXamlRoot(
+            taskbarWnd);
+
+    if (!xamlRoot) {
+        Wh_Log(
+            L"Taskbar Count Badges: "
+            L"failed to get taskbar XamlRoot");
+
+        return;
+    }
+
+    auto content =
+        xamlRoot.Content()
+            .try_as<
+                FrameworkElement>();
+
+    if (!content) {
+        Wh_Log(
+            L"Taskbar Count Badges: "
+            L"XamlRoot content unavailable");
+
+        return;
+    }
+
+    if (!g_taskbarDispatcher) {
+        g_taskbarDispatcher =
+            content.Dispatcher();
+    }
+
+    int buttonCount =
+        EnumerateExistingTaskbarButtons(
+            content);
+
+    Wh_Log(
+        L"Taskbar Count Badges: "
+        L"initial taskbar buttons=%d",
+        buttonCount);
+}
+
+// -----------------------------------------------------------------------------
+// Recount queue
+//
+// ViewModelCount can fire many times in one taskbar update.
+// All calls collapse into one real HWND recount.
+// -----------------------------------------------------------------------------
+
+void QueueRealWindowRecount() {
+    if (g_unloading ||
+        !g_taskbarDispatcher) {
+        return;
+    }
+
+    if (g_recountQueued.exchange(
+            true)) {
+        return;
+    }
+
+    try {
+        g_taskbarDispatcher.RunAsync(
+            winrt::Windows::UI::Core::
+                CoreDispatcherPriority::
+                    Normal,
+            []() {
+                g_recountQueued =
+                    false;
+
+                if (g_unloading) {
+                    return;
+                }
+
+                std::unordered_set<
+                    std::wstring>
+                    changedIds;
+
+                if (!BuildRealWindowCounts(
+                        &changedIds,
+                        false)) {
+                    return;
+                }
+
+                if (changedIds.empty()) {
+                    return;
+                }
+
+                RefreshChangedTrackedButtons(
+                    changedIds);
+            });
+    } catch (...) {
+        g_recountQueued =
+            false;
+
+        Wh_Log(
+            L"Taskbar Count Badges: "
+            L"failed to queue HWND recount");
+    }
+}
+
+// -----------------------------------------------------------------------------
+// TaskListButton::UpdateVisualStates
+//
+// Handles newly-created or recycled taskbar buttons.
+// Startup does NOT depend on this hook.
 // -----------------------------------------------------------------------------
 
 using TaskListButton_UpdateVisualStates_t =
@@ -1080,7 +1308,7 @@ TaskListButton_UpdateVisualStates_Hook(
 }
 
 // -----------------------------------------------------------------------------
-// Group AutomationId
+// TaskListGroupViewModel AutomationId
 // -----------------------------------------------------------------------------
 
 using GetAutomationId_t =
@@ -1159,57 +1387,15 @@ bool GetGroupAutomationId(
 }
 
 // -----------------------------------------------------------------------------
-// Refresh tracked buttons when REAL count changes
-// -----------------------------------------------------------------------------
-
-void RefreshAppOnTaskbarThread(
-    std::wstring automationId) {
-    if (g_unloading ||
-        !g_taskbarDispatcher) {
-        return;
-    }
-
-    std::wstring wanted =
-        NormalizeId(
-            automationId);
-
-    try {
-        g_taskbarDispatcher
-            .RunAsync(
-                winrt::Windows::UI::
-                    Core::
-                        CoreDispatcherPriority::
-                            Normal,
-                [wanted]() {
-                    if (g_unloading) {
-                        return;
-                    }
-
-                    for (auto& item :
-                         g_trackedButtons) {
-                        if (NormalizeId(
-                                item.automationId) !=
-                            wanted) {
-                            continue;
-                        }
-
-                        auto element =
-                            item.element.get();
-
-                        if (element) {
-                            ApplyCountToButton(
-                                element);
-                        }
-                    }
-                });
-    } catch (...) {
-    }
-}
-
-// -----------------------------------------------------------------------------
-// REAL live count
+// ViewModelCount
 //
-// Your logs consistently show ViewModelCount = actual windows + 1.
+// IMPORTANT:
+//
+// The returned ViewModelCount is NOT used as the displayed count.
+// This hook is only a fast notification that the taskbar's app/window state
+// changed.
+//
+// Multiple calls are collapsed by QueueRealWindowRecount().
 // -----------------------------------------------------------------------------
 
 using GetViewModelCount_t =
@@ -1236,47 +1422,7 @@ GetViewModelCount_Hook(
         return hr;
     }
 
-    std::wstring automationId;
-
-    if (!GetGroupAutomationId(
-            pThis,
-            &automationId)) {
-        return hr;
-    }
-
-    unsigned int actual =
-        NormalizeCount(
-            *count);
-
-    std::wstring key =
-        NormalizeId(
-            automationId);
-
-    auto existing =
-        g_appCounts.find(
-            key);
-
-    bool changed =
-        existing ==
-            g_appCounts.end() ||
-        existing->second !=
-            actual;
-
-    g_appCounts[
-        key] =
-        actual;
-
-    if (changed) {
-        Wh_Log(
-            L"Taskbar Count Badges: "
-            L"REAL id=\"%s\" raw=%u actual=%u",
-            automationId.c_str(),
-            *count,
-            actual);
-
-        RefreshAppOnTaskbarThread(
-            automationId);
-    }
+    QueueRealWindowRecount();
 
     return hr;
 }
@@ -1286,6 +1432,8 @@ GetViewModelCount_Hook(
 // -----------------------------------------------------------------------------
 
 void CleanupOnTaskbarThread() {
+    PruneDeadTrackedButtons();
+
     for (auto& item :
          g_trackedButtons) {
         auto element =
@@ -1309,7 +1457,6 @@ void CleanupOnTaskbarThread() {
     }
 
     g_trackedButtons.clear();
-    g_trackedButtonPointers.clear();
 
     Wh_Log(
         L"Taskbar Count Badges: "
@@ -1325,10 +1472,11 @@ bool CleanupSynchronously() {
         if (g_taskbarDispatcher
                 .HasThreadAccess()) {
             CleanupOnTaskbarThread();
+
             return true;
         }
 
-        auto op =
+        auto operation =
             g_taskbarDispatcher
                 .RunAsync(
                     winrt::Windows::UI::
@@ -1339,7 +1487,7 @@ bool CleanupSynchronously() {
                         CleanupOnTaskbarThread();
                     });
 
-        op.get();
+        operation.get();
 
         return true;
     } catch (...) {
@@ -1348,7 +1496,7 @@ bool CleanupSynchronously() {
 }
 
 // -----------------------------------------------------------------------------
-// Hook Taskbar.View
+// Taskbar.View hooks
 // -----------------------------------------------------------------------------
 
 bool HookTaskbarView(
@@ -1412,7 +1560,7 @@ bool HookTaskbarView(
 }
 
 // -----------------------------------------------------------------------------
-// Hook taskbar.dll for TaskbarHost / XamlRoot access
+// taskbar.dll symbols for XamlRoot access
 // -----------------------------------------------------------------------------
 
 bool HookTaskbarDll() {
@@ -1528,6 +1676,9 @@ BOOL Wh_ModInit() {
     g_unloading =
         false;
 
+    g_recountQueued =
+        false;
+
     g_isTaskbarProcess =
         FindCurrentProcessTaskbarWnd() !=
         nullptr;
@@ -1596,10 +1747,15 @@ void Wh_ModAfterInit() {
         return;
     }
 
-    // 1. Get startup counts.
-    BuildInitialCounts();
+    // Build accurate HWND counts first.
+    if (!BuildRealWindowCounts(
+            nullptr,
+            true)) {
+        return;
+    }
 
-    // 2. DIRECTLY enumerate the taskbar's existing XAML tree.
+    // Then immediately attach badges to all already-existing
+    // taskbar buttons through the existing XAML tree.
     HWND taskbarWnd =
         FindCurrentProcessTaskbarWnd();
 
@@ -1613,8 +1769,7 @@ void Wh_ModAfterInit() {
             taskbarWnd)) {
         Wh_Log(
             L"Taskbar Count Badges: "
-            L"failed to execute initial enumeration "
-            L"on taskbar thread");
+            L"initial taskbar-thread execution failed");
     }
 }
 
@@ -1638,9 +1793,11 @@ void Wh_ModBeforeUninit() {
 }
 
 void Wh_ModUninit() {
+    g_recountQueued =
+        false;
+
     g_appCounts.clear();
     g_trackedButtons.clear();
-    g_trackedButtonPointers.clear();
 
     g_taskbarDispatcher =
         nullptr;
