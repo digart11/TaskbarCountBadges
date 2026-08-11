@@ -6,6 +6,16 @@ Taskbar Count Badges adds a small customizable indicator to taskbar app buttons
 when an app has multiple open windows. The indicator can be shown as either a
 **number badge** or a compact stack of **vertical dots**.
 
+## Screenshots
+
+### Customization examples
+
+![Taskbar Count Badges examples](images/showcase.png)
+
+### Settings
+
+![Taskbar Count Badges settings](images/settings.png)
+
 ## Display styles
 
 ### Number badge
