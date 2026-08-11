@@ -1247,21 +1247,29 @@ void ApplyBadgeVisualStyle(
         text.FontWeight(
             GetConfiguredFontWeight());
 
-        text.HorizontalAlignment(
-            HorizontalAlignment::Center);
+    text.HorizontalAlignment(
+        HorizontalAlignment::Center);
 
-        text.VerticalAlignment(
-            VerticalAlignment::Center);
+    text.VerticalAlignment(
+        VerticalAlignment::Center);
 
-        text.TextAlignment(
-            TextAlignment::Center);
+    text.TextAlignment(
+        TextAlignment::Center);
 
-        text.Text(
-            MakeNumberText(
-                count));
+    // Optical correction for the font baseline.
+    text.Margin(
+        Thickness{
+            0,
+            -2,
+            0,
+            0});
 
-        return;
-    }
+    text.Text(
+        MakeNumberText(
+            count));
+
+    return;
+}
 
     // ---------------------------------------------------------------------
     // VERTICAL DOTS
