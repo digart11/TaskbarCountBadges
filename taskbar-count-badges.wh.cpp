@@ -37,11 +37,11 @@ when an app has multiple open windows. The indicator can be shown as either a
 
 ### Customization examples
 
-![Taskbar Count Badges examples](images/showcase.png)
+![Taskbar Count Badges examples](https://raw.githubusercontent.com/digart11/TaskbarCountBadges/main/images/showcase.png)
 
 ### Settings
 
-![Taskbar Count Badges settings](images/settings.png)
+![Taskbar Count Badges settings](https://raw.githubusercontent.com/digart11/TaskbarCountBadges/main/images/settings.png)
 
 ## Display styles
 
