@@ -1,26 +1,26 @@
 # Taskbar Count Badges
 
-See how many windows are open for each app directly on the Windows 11 taskbar.
+See how many windows are represented by each app button on the Windows 11 taskbar.
 
-Taskbar Count Badges adds a small customizable indicator to taskbar app buttons
-when an app has multiple open windows. The indicator can be shown as either a
+Taskbar Count Badges adds a small customizable indicator when a taskbar app
+button represents multiple windows. The indicator can be shown as either a
 **number badge** or a compact stack of **vertical dots**.
 
 ## Screenshots
 
 ### Customization examples
 
-![Taskbar Count Badges examples](images/showcase.png)
+![Taskbar Count Badges examples](https://raw.githubusercontent.com/digart11/TaskbarCountBadges/main/images/showcase.png)
 
 ### Settings
 
-![Taskbar Count Badges settings](images/settings.png)
+![Taskbar Count Badges settings](https://raw.githubusercontent.com/digart11/TaskbarCountBadges/main/images/settings.png)
 
 ## Display styles
 
 ### Number badge
 
-Shows the exact number of open windows for an app.
+Shows the number of windows represented by that taskbar button.
 
 The badge can be customized with:
 
@@ -42,8 +42,8 @@ Shows a minimal vertical stack of dots beside the app icon.
 
 ## Behavior
 
-By default, no indicator is shown for a single open window. The indicator appears
-when an app reaches two open windows.
+By default, no indicator is shown when a taskbar button represents a single
+window. The indicator appears when that button represents two or more windows.
 
 The minimum window count can be changed in the settings.
 
@@ -56,6 +56,11 @@ settings are applied live.
 - Supports x64 and ARM64 Windows
 - Works with multiple monitors and secondary Windows taskbars
 
+On multi-monitor systems, the count follows each individual taskbar button.
+Depending on the Windows multi-monitor taskbar configuration, the same app can
+therefore show different counts on different monitors. Moving a window between
+monitors can change the count shown on each taskbar.
+
 The mod is designed primarily for grouped/combined taskbar app buttons. When
 taskbar buttons are configured to stay uncombined, Windows can expose multiple
 buttons for the same app group, so the same app count may appear on more than
@@ -66,9 +71,9 @@ taskbar may not be compatible.
 
 ## Notes
 
-The mod counts real top-level application windows and maps them to their Windows
-application IDs. Windows shell infrastructure windows are excluded from the
-count.
+The mod uses the taskbar's own per-button grouping information instead of
+independently scanning all desktop windows. Counts therefore follow Windows
+taskbar grouping, including per-taskbar behavior on multi-monitor systems.
 
 The badge is visual only and doesn't change taskbar grouping, combining, window
 ordering, or application behavior.
